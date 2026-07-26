@@ -25,8 +25,12 @@ SRC_OUTLINE_WIDTH = 1
 SRC_SHADOW_COLOR = '&H80000000'
 TRANS_FONT_COLOR = '&H00FFFF'
 TRANS_OUTLINE_COLOR = '&H000000'
-TRANS_OUTLINE_WIDTH = 1 
+TRANS_OUTLINE_WIDTH = 1
 TRANS_BACK_COLOR = '&H33000000'
+TRANS_MARGIN_V = 27
+
+# libass script height ffmpeg uses when converting an srt to ass, all margins are in this scale
+PLAY_RES_Y = 288
 
 OUTPUT_DIR = "output"
 OUTPUT_VIDEO = f"{OUTPUT_DIR}/output_sub.mp4"
@@ -39,6 +43,41 @@ def check_gpu_available():
         return 'h264_nvenc' in result.stdout
     except:
         return False
+
+def load_key_safe(key, default=None):
+    """Config files written before a key existed should not break the merge."""
+    try:
+        return load_key(key)
+    except KeyError:
+        return default
+
+def build_cover_bar(width, height):
+    """Black bar hiding subtitles already burned into the source video.
+
+    Returns the drawbox filter (or None) and the MarginV to use for the
+    translated subtitles so they land on top of that bar.
+    """
+    cfg = load_key_safe("cover_hardcoded_subtitles") or {}
+    if not cfg.get("enable"):
+        return None, TRANS_MARGIN_V
+
+    height_ratio = float(cfg.get("height_ratio", 0.16))
+    offset_ratio = float(cfg.get("bottom_offset_ratio", 0.0))
+    bar_height = max(1, int(height * height_ratio))
+    offset = int(height * offset_ratio)
+    y = max(0, height - bar_height - offset)
+    drawbox = f"drawbox=x=0:y={y}:w={width}:h={bar_height}:color=black@1.0:t=fill"
+
+    if load_key_safe("burn_src_subtitles", True):
+        # source line sits at the default MarginV, translation stacks above it
+        margin_v = TRANS_MARGIN_V
+    else:
+        # single line, center it vertically inside the bar
+        center_ratio = offset_ratio + height_ratio / 2
+        margin_v = max(2, round(center_ratio * PLAY_RES_Y - TRANS_FONT_SIZE / 2))
+
+    rprint(f"[bold green]🩹 Covering hardcoded subtitles with a {bar_height}px black bar.[/bold green]")
+    return drawbox, margin_v
 
 def merge_subtitles_to_video():
     from core._1_ytdlp import is_audio_only_input
@@ -72,19 +111,28 @@ def merge_subtitles_to_video():
     TARGET_HEIGHT = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
-    ffmpeg_cmd = [
-        'ffmpeg', '-i', video_file,
-        '-vf', (
-            f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
-            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-            f"subtitles={SRC_SRT}:force_style='FontSize={SRC_FONT_SIZE},FontName={FONT_NAME}," 
-            f"PrimaryColour={SRC_FONT_COLOR},OutlineColour={SRC_OUTLINE_COLOR},OutlineWidth={SRC_OUTLINE_WIDTH},"
-            f"ShadowColour={SRC_SHADOW_COLOR},BorderStyle=1',"
-            f"subtitles={TRANS_SRT}:force_style='FontSize={TRANS_FONT_SIZE},FontName={TRANS_FONT_NAME},"
-            f"PrimaryColour={TRANS_FONT_COLOR},OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
-            f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV=27,BorderStyle=4'"
-        ).encode('utf-8'),
+    cover_bar, trans_margin_v = build_cover_bar(TARGET_WIDTH, TARGET_HEIGHT)
+
+    filters = [
+        f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease",
+        f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2",
     ]
+    # the bar goes down first so every subtitle below is drawn on top of it
+    if cover_bar:
+        filters.append(cover_bar)
+    if load_key_safe("burn_src_subtitles", True):
+        filters.append(
+            f"subtitles={SRC_SRT}:force_style='FontSize={SRC_FONT_SIZE},FontName={FONT_NAME},"
+            f"PrimaryColour={SRC_FONT_COLOR},OutlineColour={SRC_OUTLINE_COLOR},OutlineWidth={SRC_OUTLINE_WIDTH},"
+            f"ShadowColour={SRC_SHADOW_COLOR},BorderStyle=1'"
+        )
+    filters.append(
+        f"subtitles={TRANS_SRT}:force_style='FontSize={TRANS_FONT_SIZE},FontName={TRANS_FONT_NAME},"
+        f"PrimaryColour={TRANS_FONT_COLOR},OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
+        f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV={trans_margin_v},BorderStyle=4'"
+    )
+
+    ffmpeg_cmd = ['ffmpeg', '-i', video_file, '-vf', ",".join(filters).encode('utf-8')]
 
     ffmpeg_gpu = load_key("ffmpeg_gpu")
     if ffmpeg_gpu:

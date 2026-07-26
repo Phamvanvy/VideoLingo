@@ -11,15 +11,15 @@ display_language: "zh-CN"
 
 # API settings
 api:
-  key: 'YOUR_API_KEY'
-  base_url: 'https://yunwu.ai'
-  model: 'gpt-5.5'
-  llm_support_json: false
+  key: '123'
+  base_url: 'http://localhost:8080/v1'
+  model: 'E:\model\HauhauCS\Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive\Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf'
+  llm_support_json: true
 # *Number of LLM multi-threaded accesses, set to 1 if using local LLM
 max_workers: 4
 
 # Language settings, written into the prompt, can be described in natural language
-target_language: '简体中文'
+target_language: 'Vietnamese'
 
 # Whether to use Demucs for vocal separation before transcription
 demucs: false
@@ -28,7 +28,7 @@ whisper:
   # ["large-v3", "large-v3-turbo"]. Note: for zh model will force to use Belle/large-v3
   model: 'large-v3'
   # Whisper specified recognition language ISO 639-1
-  language: 'en'
+  language: 'zh'
   detected_language: 'en'
   # Whisper running mode ["local", "cloud", "elevenlabs"]. Specifies where to run, cloud uses 302.ai API
   runtime: 'local'
@@ -40,9 +40,21 @@ whisper:
 # Whether to burn subtitles into the video
 burn_subtitles: true
 
+# Whether to also burn the source-language subtitles (set false to show the translation only)
+burn_src_subtitles: false
+
+# Cover hardcoded subtitles already baked into the source video with a black bar,
+# then draw the translated subtitles on top of that bar
+cover_hardcoded_subtitles:
+  enable: true
+  # Bar height as a ratio of the video height
+  height_ratio: 0.16
+  # Gap between the bar and the bottom edge, as a ratio of the video height
+  bottom_offset_ratio: 0.0
+
 ## ======================== Advanced Settings ======================== ##
 # *🔬 h264_nvenc GPU acceleration for ffmpeg, make sure your GPU supports it
-ffmpeg_gpu: false
+ffmpeg_gpu: true
 
 # *Youtube settings
 youtube:
@@ -71,7 +83,7 @@ pause_before_translate: false
 
 ## ======================== Dubbing Settings ======================== ##
 # TTS selection [sf_fish_tts, openai_tts, gpt_sovits, azure_tts, fish_tts, edge_tts, custom_tts]
-tts_method: 'azure_tts'
+tts_method: 'custom_tts'
 
 # SiliconFlow FishTTS
 sf_fish_tts:

@@ -6,6 +6,7 @@ import numpy as np
 from rich.console import Console
 
 from core._1_ytdlp import find_video_files
+from core._7_sub_into_vid import build_cover_bar
 from core.asr_backend.audio_preprocess import normalize_audio_volume
 from core.utils import *
 from core.utils.models import *
@@ -62,19 +63,23 @@ def merge_video_audio():
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
     
+    cover_bar, trans_margin_v = build_cover_bar(TARGET_WIDTH, TARGET_HEIGHT)
+
     subtitle_filter = (
         f"subtitles={DUB_SUB_FILE}:force_style='FontSize={TRANS_FONT_SIZE},"
         f"FontName={TRANS_FONT_NAME},PrimaryColour={TRANS_FONT_COLOR},"
         f"OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
-        f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV=27,BorderStyle=4'"
+        f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV={trans_margin_v},BorderStyle=4'"
     )
-    
+    # the bar goes down before the subtitles so they are drawn on top of it
+    cover_filter = f'{cover_bar},' if cover_bar else ''
+
     cmd = [
         'ffmpeg', '-y', '-i', VIDEO_FILE, '-i', background_file, '-i', normalized_dub_audio,
         '-filter_complex',
         f'[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,'
         f'pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,'
-        f'{subtitle_filter}[v];'
+        f'{cover_filter}{subtitle_filter}[v];'
         f'[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3[a]'
     ]
 
