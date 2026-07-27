@@ -51,29 +51,52 @@ def load_key_safe(key, default=None):
     except KeyError:
         return default
 
-def build_cover_bar(width, height):
+def _fixed_bar(cfg, height):
+    """Bar geometry from the static ratios in config."""
+    height_ratio = float(cfg.get("height_ratio", 0.25))
+    offset_ratio = float(cfg.get("bottom_offset_ratio", 0.0))
+    bar_height = max(1, int(height * height_ratio))
+    y = max(0, height - bar_height - int(height * offset_ratio))
+    return y, bar_height
+
+
+def build_cover_bar(width, height, video_file=None, single_line=False):
     """Black bar hiding subtitles already burned into the source video.
 
     Returns the drawbox filter (or None) and the MarginV to use for the
-    translated subtitles so they land on top of that bar.
+    translated subtitles. In "auto" mode the band is detected from the video
+    itself; detection failures fall back to the fixed ratios in config.
     """
     cfg = load_key_safe("cover_hardcoded_subtitles") or {}
     if not cfg.get("enable"):
         return None, TRANS_MARGIN_V
 
-    height_ratio = float(cfg.get("height_ratio", 0.16))
-    offset_ratio = float(cfg.get("bottom_offset_ratio", 0.0))
-    bar_height = max(1, int(height * height_ratio))
-    offset = int(height * offset_ratio)
-    y = max(0, height - bar_height - offset)
+    y = bar_height = None
+    if cfg.get("mode", "auto") == "auto" and video_file:
+        from core.utils.hardsub_detect import detect_subtitle_band
+        band = detect_subtitle_band(video_file, height, cfg.get("detection") or {})
+        if band:
+            y, bar_height = band["y"], band["height"]
+            rprint(f"[bold green]🔍 Detected hardcoded subtitles at y={y} "
+                   f"({bar_height}px tall, confidence {band['confidence']}).[/bold green]")
+        else:
+            rprint("[bold yellow]⚠️ Auto-detection found no hardcoded subtitles; "
+                   "falling back to the fixed ratios in config.[/bold yellow]")
+    if y is None:
+        y, bar_height = _fixed_bar(cfg, height)
+
     drawbox = f"drawbox=x=0:y={y}:w={width}:h={bar_height}:color=black@1.0:t=fill"
 
-    if load_key_safe("burn_src_subtitles", True):
-        # source line sits at the default MarginV, translation stacks above it
+    # The translated subtitles always render near the bottom of the frame, so a
+    # bar detected in the upper half (subtitles burned at the top) must not drag
+    # them up there -- only a bar in the lower half dictates their position.
+    bar_in_lower_half = (y + bar_height / 2) > height / 2
+    if not bar_in_lower_half or not (single_line or not load_key_safe("burn_src_subtitles", True)):
+        # two stacked lines, or a bar elsewhere: keep the default bottom position
         margin_v = TRANS_MARGIN_V
     else:
         # single line, center it vertically inside the bar
-        center_ratio = offset_ratio + height_ratio / 2
+        center_ratio = (height - (y + bar_height / 2)) / height
         margin_v = max(2, round(center_ratio * PLAY_RES_Y - TRANS_FONT_SIZE / 2))
 
     rprint(f"[bold green]🩹 Covering hardcoded subtitles with a {bar_height}px black bar.[/bold green]")
@@ -111,7 +134,7 @@ def merge_subtitles_to_video():
     TARGET_HEIGHT = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
-    cover_bar, trans_margin_v = build_cover_bar(TARGET_WIDTH, TARGET_HEIGHT)
+    cover_bar, trans_margin_v = build_cover_bar(TARGET_WIDTH, TARGET_HEIGHT, video_file)
 
     filters = [
         f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease",

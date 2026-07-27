@@ -29,7 +29,7 @@ whisper:
   model: 'large-v3'
   # Whisper specified recognition language ISO 639-1
   language: 'zh'
-  detected_language: 'en'
+  detected_language: 'zh'
   # Whisper running mode ["local", "cloud", "elevenlabs"]. Specifies where to run, cloud uses 302.ai API
   runtime: 'local'
   # 302.ai API key
@@ -47,8 +47,21 @@ burn_src_subtitles: false
 # then draw the translated subtitles on top of that bar
 cover_hardcoded_subtitles:
   enable: true
+  # auto = detect the subtitle band in the video; fixed = always use the ratios below
+  mode: auto
+  detection:
+    # Number of frames sampled across the video
+    sample_frames: 100
+    # Extra margin added around the detected band, as a ratio of the video height
+    padding_ratio: 0.015
+    # Below this confidence the detection is discarded and the ratios below are used
+    min_confidence: 0.35
+    # Detected bands outside this size range (ratio of video height) are ignored
+    min_band_ratio: 0.02
+    max_band_ratio: 0.35
+  # Used when mode is fixed, or when auto detection is not confident enough.
   # Bar height as a ratio of the video height
-  height_ratio: 0.16
+  height_ratio: 0.25
   # Gap between the bar and the bottom edge, as a ratio of the video height
   bottom_offset_ratio: 0.0
 

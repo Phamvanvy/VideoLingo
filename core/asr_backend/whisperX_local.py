@@ -78,6 +78,9 @@ def check_hf_mirror():
 @except_handler("WhisperX processing error:")
 def transcribe_audio(raw_audio_file, vocal_audio_file, start, end):
     os.environ['HF_ENDPOINT'] = check_hf_mirror()
+    # HF's Xet CDN backend has been returning 403s for some networks/regions;
+    # disable it so downloads fall back to the plain HTTP path.
+    os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
     WHISPER_LANGUAGE = load_key("whisper.language")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rprint(f"🚀 Starting WhisperX using device: {device} ...")
@@ -159,6 +162,10 @@ def transcribe_audio(raw_audio_file, vocal_audio_file, start, end):
 
     # Save language
     update_key("whisper.language", result['language'])
+    # Also record the detected language: downstream NLP splitting (spaCy model
+    # selection) and prompt building read whisper.detected_language, which
+    # otherwise stays stuck at its config default and picks the wrong model.
+    update_key("whisper.detected_language", result['language'])
     if result['language'] == 'zh' and WHISPER_LANGUAGE != 'zh':
         raise ValueError("Please specify the transcription language as zh and try again!")
 
