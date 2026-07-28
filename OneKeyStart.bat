@@ -10,6 +10,14 @@ set "C_RED=%ESC%[31m"
 set "C_CYAN=%ESC%[36m"
 set "C_BOLD=%ESC%[1m"
 
+rem Model cache on the E: drive so downloads survive restarts and stay off C:.
+rem A user/system HF_HOME (or TORCH_HOME) takes priority if already set.
+if not defined HF_HOME set "HF_HOME=E:\ai_cache\huggingface"
+if not defined TORCH_HOME set "TORCH_HOME=E:\ai_cache\torch"
+if not exist "%HF_HOME%" mkdir "%HF_HOME%" 2>nul
+if not exist "%TORCH_HOME%" mkdir "%TORCH_HOME%" 2>nul
+echo %C_CYAN%Model cache:%C_RESET% %HF_HOME%
+
 if not exist "logs" mkdir "logs"
 for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value') do set dt=%%I
 set "LOGFILE=logs\videolingo_%dt:~0,8%_%dt:~8,6%.log"

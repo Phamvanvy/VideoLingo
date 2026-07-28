@@ -52,16 +52,30 @@ cover_hardcoded_subtitles:
   detection:
     # Number of frames sampled across the video
     sample_frames: 100
-    # Extra margin added around the detected band, as a ratio of the video height
-    padding_ratio: 0.015
+    # Extra margin added around the detected band, as a ratio of the video height.
+    # Raise it if any of the old subtitles still peek out above or below the bar.
+    padding_ratio: 0.006
     # Below this confidence the detection is discarded and the ratios below are used
     min_confidence: 0.35
     # Detected bands outside this size range (ratio of video height) are ignored
     min_band_ratio: 0.02
     max_band_ratio: 0.35
+  # Size the translated subtitles to the glyph height measured in the source
+  # video instead of using the fixed default, so one line fills the bar.
+  match_source_font_size: true
+  # Translated glyph height relative to the source glyph height. Keep it at or
+  # just below 1.0 -- the translation is wider than the Chinese it replaces, so
+  # it covers the line horizontally even at the same height.
+  font_scale: 0.95
+  # Bounds for the matched size, in the 288px libass script scale (default 17)
+  min_font_size: 10
+  max_font_size: 30
+  # What sits behind the translated text: auto = an opaque box only when there
+  # is no cover bar, box = always, outline = never (bar only)
+  text_backdrop: auto
   # Used when mode is fixed, or when auto detection is not confident enough.
   # Bar height as a ratio of the video height
-  height_ratio: 0.25
+  height_ratio: 0.10
   # Gap between the bar and the bottom edge, as a ratio of the video height
   bottom_offset_ratio: 0.0
 

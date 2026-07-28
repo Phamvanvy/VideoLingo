@@ -6,7 +6,7 @@ import numpy as np
 from rich.console import Console
 
 from core._1_ytdlp import find_video_files
-from core._7_sub_into_vid import build_cover_bar
+from core._7_sub_into_vid import build_cover_bar, trans_backdrop_style
 from core.asr_backend.audio_preprocess import normalize_audio_volume
 from core.utils import *
 from core.utils.models import *
@@ -17,7 +17,8 @@ DUB_VIDEO = "output/output_dub.mp4"
 DUB_SUB_FILE = 'output/dub.srt'
 DUB_AUDIO = 'output/dub.mp3'
 
-TRANS_FONT_SIZE = 17
+# Size and backdrop now come from build_cover_bar/trans_backdrop_style, so that
+# the dubbed video is laid out exactly like the subtitled one.
 TRANS_FONT_NAME = 'Arial'
 if platform.system() == 'Linux':
     TRANS_FONT_NAME = 'NotoSansCJK-Regular'
@@ -26,8 +27,7 @@ if platform.system() == 'Darwin':
 
 TRANS_FONT_COLOR = '&H00FFFF'
 TRANS_OUTLINE_COLOR = '&H000000'
-TRANS_OUTLINE_WIDTH = 1 
-TRANS_BACK_COLOR = '&H33000000'
+TRANS_OUTLINE_WIDTH = 1
 
 def merge_video_audio():
     """Merge video and audio, and reduce video volume"""
@@ -64,13 +64,15 @@ def merge_video_audio():
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
     
     # only dub.srt is burned here, so the bar must center a single line
-    cover_bar, trans_margin_v = build_cover_bar(TARGET_WIDTH, TARGET_HEIGHT, VIDEO_FILE, single_line=True)
+    cover_bar, trans_margin_v, trans_font_size = build_cover_bar(
+        TARGET_WIDTH, TARGET_HEIGHT, VIDEO_FILE, single_line=True
+    )
 
     subtitle_filter = (
-        f"subtitles={DUB_SUB_FILE}:force_style='FontSize={TRANS_FONT_SIZE},"
+        f"subtitles={DUB_SUB_FILE}:force_style='FontSize={trans_font_size},"
         f"FontName={TRANS_FONT_NAME},PrimaryColour={TRANS_FONT_COLOR},"
         f"OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
-        f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV={trans_margin_v},BorderStyle=4'"
+        f"Alignment=2,MarginV={trans_margin_v},{trans_backdrop_style(bool(cover_bar))}'"
     )
     # the bar goes down before the subtitles so they are drawn on top of it
     cover_filter = f'{cover_bar},' if cover_bar else ''

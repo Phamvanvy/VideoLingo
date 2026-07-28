@@ -16,6 +16,7 @@ from core.st_utils.task_runner import TaskRunner
 from core import *
 from translations.translations import DISPLAY_LANGUAGES, init_display_language, set_display_language
 from core.utils.models import _TEXT_DONE_MARKER, _AUDIO_DONE_MARKER
+from core.utils.rerun import STAGES, invalidate_from, stage_index
 
 # SET PATH
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -120,7 +121,12 @@ def _clear_path(path):
 
 
 def _get_text_steps():
-    """Return the subtitle processing steps as (label, callable) list."""
+    """Return the subtitle processing steps as (label, callable) list.
+
+    One entry per stage in ``core.utils.rerun.STAGES``, in the same order, plus
+    the done marker: ``_rerun_controls`` slices this list by stage index to
+    restart part-way through.
+    """
     steps = [
         (t("WhisperX word-level transcription"), _2_asr.transcribe),
         (
@@ -150,7 +156,42 @@ def _get_text_steps():
             lambda: _touch(_TEXT_DONE_MARKER),
         ),
     ]
+    assert len(steps) == len(STAGES) + 1, "step list drifted out of sync with STAGES"
     return steps
+
+
+def _rerun_controls(runner):
+    """Restart the pipeline part-way through, reusing the earlier stages.
+
+    Whisper transcription dominates the runtime, and swapping the translation
+    model or the way subtitles are drawn does not invalidate it, so the common
+    tweaks should never pay for it again.
+    """
+    options = [stage for stage in STAGES if stage["key"] != "asr"]
+    labels = [t(stage["label"]) for stage in options]
+
+    with st.expander(t("Re-run part of the pipeline"), expanded=False):
+        st.caption(
+            t(
+                "Everything before the selected stage is reused, so the transcription "
+                "is never redone. Change the model or the subtitle settings in the "
+                "sidebar first, then pick where to restart."
+            )
+        )
+        choice = st.selectbox(
+            t("Re-run from"), labels, index=len(labels) - 1, key="rerun_stage"
+        )
+        stage_key = options[labels.index(choice)]["key"]
+
+        if stage_key != "burn":
+            st.warning(
+                t("This rewrites the subtitles, so the dubbing output is discarded too.")
+            )
+
+        if st.button(t("Re-run"), key="rerun_button"):
+            invalidate_from(stage_key)
+            runner.start(_get_text_steps()[stage_index(stage_key):])
+            st.rerun()
 
 
 def _subtitle_length_controls():
@@ -267,6 +308,8 @@ def text_processing_section():
             if not audio_only and load_key("burn_subtitles") and os.path.exists(SUB_VIDEO):
                 st.video(SUB_VIDEO)
             download_subtitle_zip_button(text=t("Download All Srt Files"))
+
+            _rerun_controls(runner)
 
             if st.button(t("Archive to 'history'"), key="cleanup_in_text_processing"):
                 cleanup()

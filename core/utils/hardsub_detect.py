@@ -16,7 +16,7 @@ from core.utils import rprint
 
 # Bump whenever the algorithm or the constants below change, so cached results
 # from an older detector are recomputed instead of silently reused.
-DETECTOR_VERSION = 3
+DETECTOR_VERSION = 4
 
 CACHE_FILE = "output/log/hardsub_region.json"
 DEBUG_IMAGE = "output/log/hardsub_debug.png"
@@ -58,6 +58,12 @@ STATIC_FLOOR = 0.25
 # a bad field.
 ABS_STRENGTH_REF = 0.12
 CONTRAST_REF = 3.0
+
+# The band spans the full ink extent, tails included, because it has to *cover*
+# the old subtitles. Glyph height is a different question -- it drives the font
+# size of the replacement line -- so it is measured separately as the rows whose
+# peak score reaches this share of the band's own peak.
+TEXT_CORE_RATIO = 0.5
 
 
 def _sample_gray_frames(cap, sample_frames):
@@ -143,6 +149,21 @@ def _grow_band(band, grow_bands):
     return top, bottom
 
 
+def _text_core(peak, top, bottom):
+    """Rows inside a band where the glyphs actually are.
+
+    The band tapers off at both ends -- antialiasing, outlines and descenders
+    all light up rows that carry no real glyph body. Cutting at a share of the
+    band's own peak leaves the dense part, which is what a reader perceives as
+    the text height.
+    """
+    band_peak = peak[top:bottom + 1]
+    rows = np.where(band_peak >= TEXT_CORE_RATIO * band_peak.max())[0]
+    if len(rows) == 0:
+        return top, bottom
+    return top + int(rows[0]), top + int(rows[-1])
+
+
 def _analyze(grays, cfg):
     """Score every candidate band; return the best one in work-resolution rows."""
     scores = np.array([_row_scores(g) for g in grays])  # (n_frames, work_h)
@@ -173,6 +194,7 @@ def _analyze(grays, cfg):
     band_row_score = float(row_score[top:bottom + 1].mean())
     band_strength = float(strength[top:bottom + 1].mean())
     median_row_score = float(np.median(row_score))
+    core_top, core_bottom = _text_core(peak, top, bottom)
 
     abs_conf = float(np.clip(band_strength / ABS_STRENGTH_REF, 0.0, 1.0))
     ratio = band_row_score / max(median_row_score, 1e-6)
@@ -188,13 +210,19 @@ def _analyze(grays, cfg):
         "contrast_conf": round(contrast_conf, 3),
         "active_thresh": round(active_thresh, 4),
         "work_height": work_h,
+        "core_rows": [core_top, core_bottom],
     }
-    return (top, bottom, confidence), stats
+    return (top, bottom, confidence, core_top, core_bottom), stats
 
 
-def _cache_key(video_path):
+def _cache_key(video_path, cfg):
+    # The cached band is already padded and confidence-filtered, so the settings
+    # that produced it belong in the key -- otherwise retuning them in config
+    # would silently keep returning the old band.
     st = os.stat(video_path)
-    return f"{os.path.basename(video_path)}|{st.st_size}|{int(st.st_mtime)}|v{DETECTOR_VERSION}"
+    settings = json.dumps(cfg, sort_keys=True, default=str)
+    return (f"{os.path.basename(video_path)}|{st.st_size}|{int(st.st_mtime)}"
+            f"|{settings}|v{DETECTOR_VERSION}")
 
 
 def _read_cache(key):
@@ -228,11 +256,13 @@ def _write_cache(key, value):
 def detect_subtitle_band(video_path, height, cfg=None, use_cache=True):
     """Row band of hardcoded subtitles, in full-resolution coordinates.
 
-    Returns ``{"y", "height", "confidence"}`` or None when nothing is found
-    confidently enough, in which case the caller should fall back to fixed ratios.
+    Returns ``{"y", "height", "text_height", "confidence"}`` or None when nothing
+    is found confidently enough, in which case the caller should fall back to
+    fixed ratios. ``height`` spans everything that must be covered; the smaller
+    ``text_height`` is the glyph height the replacement subtitles should match.
     """
     cfg = cfg or {}
-    key = _cache_key(video_path)
+    key = _cache_key(video_path, cfg)
     if use_cache:
         cached = _read_cache(key)
         if cached is not None:
@@ -256,10 +286,10 @@ def detect_subtitle_band(video_path, height, cfg=None, use_cache=True):
 
     band = None
     if result is not None:
-        top, bottom, confidence = result
+        top, bottom, confidence, core_top, core_bottom = result
         if confidence >= min_confidence:
             work_h = stats["work_height"]
-            pad = int(float(cfg.get("padding_ratio", 0.015)) * work_h)
+            pad = int(float(cfg.get("padding_ratio", 0.006)) * work_h)
             top = max(0, top - pad)
             bottom = min(work_h - 1, bottom + pad)
             scale = height / work_h
@@ -267,6 +297,7 @@ def detect_subtitle_band(video_path, height, cfg=None, use_cache=True):
             band = {
                 "y": max(0, y),
                 "height": max(1, min(height - y, int(round((bottom - top + 1) * scale)))),
+                "text_height": max(1, int(round((core_bottom - core_top + 1) * scale))),
                 "confidence": round(confidence, 3),
             }
         else:
@@ -275,6 +306,33 @@ def detect_subtitle_band(video_path, height, cfg=None, use_cache=True):
 
     _write_cache(key, {"band": band, "stats": stats})
     return band
+
+
+def _preview_frame(sample, band, height):
+    """Paint the bar and the matched font height onto a frame, as burning would.
+
+    Burning a full feature to inspect a bar costs an encode of the whole video,
+    so the preview has to answer "is the bar too big" on its own.
+    """
+    from core._7_sub_into_vid import PLAY_RES_Y, _matched_font_size
+    from core.utils.config_utils import load_key
+
+    cfg = load_key("cover_hardcoded_subtitles") or {}
+    y, bar_h = band["y"], band["height"]
+    # Darkened rather than filled: burning paints it solid black, but the point
+    # of the preview is to see whether the old text falls inside the bar.
+    sample[y:y + bar_h, :] = (sample[y:y + bar_h, :] * 0.35).astype(sample.dtype)
+
+    font_size = _matched_font_size(band["text_height"], height, cfg)
+    em_px = round(font_size / PLAY_RES_Y * height)
+    center = y + bar_h // 2
+    top, bottom = center - em_px // 2, center + em_px // 2
+    cv2.rectangle(sample, (0, top), (sample.shape[1] - 1, bottom), (0, 255, 255), 2)
+    cv2.rectangle(sample, (0, y), (sample.shape[1] - 1, y + bar_h - 1), (0, 0, 255), 2)
+    print(f"bar            : {bar_h}px ({bar_h / height:.1%} of the frame)")
+    print(f"matched font   : FontSize={font_size} -> {em_px}px em "
+          f"vs {band['text_height']}px of source glyphs")
+    return sample
 
 
 def _debug_main(video_path):
@@ -314,10 +372,8 @@ def _debug_main(video_path):
     cap.release()
 
     if ok:
-        cv2.rectangle(sample, (0, band["y"]), (sample.shape[1] - 1, band["y"] + band["height"] - 1),
-                      (0, 0, 255), 3)
         os.makedirs(os.path.dirname(DEBUG_IMAGE), exist_ok=True)
-        cv2.imwrite(DEBUG_IMAGE, sample)
+        cv2.imwrite(DEBUG_IMAGE, _preview_frame(sample, band, height))
         print(f"debug image    : {DEBUG_IMAGE} (frame {indices[busiest]})")
 
 
