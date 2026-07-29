@@ -51,6 +51,75 @@ def load_key_safe(key, default=None):
     except KeyError:
         return default
 
+
+# Audio codecs an MP4 container can carry as-is. Anything else (opus, vorbis,
+# wmav2 -- reachable through the webm/mkv/wmv inputs VideoLingo accepts) has to
+# be converted even though the filter chain never touches the audio.
+_MP4_SAFE_AUDIO = {"aac", "mp3", "alac", "ac3", "eac3"}
+
+
+def _ffprobe(video_file, *args):
+    """Single ffprobe field, or None when it is missing or ffprobe is absent."""
+    cmd = ['ffprobe', '-v', 'error', *args, '-of', 'default=nw=1:nk=1', video_file]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    return lines[0] if lines and lines[0] != "N/A" else None
+
+
+def source_video_bitrate(video_file):
+    """Bitrate of the source video stream in bits per second, or None.
+
+    Some containers report no per-stream bitrate, so the container total minus a
+    rough audio allowance stands in for it.
+    """
+    stream = _ffprobe(video_file, '-select_streams', 'v:0', '-show_entries', 'stream=bit_rate')
+    if stream and stream.isdigit() and int(stream) > 0:
+        return int(stream)
+    total = _ffprobe(video_file, '-show_entries', 'format=bit_rate')
+    if total and total.isdigit() and int(total) > 200_000:
+        return int(total) - 192_000
+    return None
+
+
+def video_encoder_args(video_file):
+    """-c:v flags that re-encode at roughly the bitrate of the source.
+
+    Burning subtitles forces a full re-encode, and both encoders otherwise pick
+    a quality that has nothing to do with the input -- h264_nvenc in particular
+    falls back to its own 2 Mbps default, which visibly softens anything shot
+    higher. Targeting the measured source bitrate keeps the output looking like
+    the input; the headroom on maxrate absorbs the sharp glyph edges the burn
+    adds, which cost more bits than the picture underneath them.
+    """
+    gpu = load_key("ffmpeg_gpu")
+    if gpu:
+        rprint("[bold green]will use GPU acceleration.[/bold green]")
+    base = ['-c:v', 'h264_nvenc', '-preset', 'p5', '-rc', 'vbr'] if gpu else \
+           ['-c:v', 'libx264', '-preset', 'medium']
+
+    bitrate = source_video_bitrate(video_file)
+    if bitrate:
+        rprint(f"[bold green]📊 Matching the source video bitrate: {bitrate / 1e6:.2f} Mbps.[/bold green]")
+        return base + ['-b:v', str(bitrate),
+                       '-maxrate', str(int(bitrate * 1.5)),
+                       '-bufsize', str(bitrate * 3)]
+
+    rprint("[bold yellow]⚠️ Could not read the source bitrate; falling back to constant quality.[/bold yellow]")
+    # -b:v 0 is what actually arms nvenc's constant-quality mode; without it
+    # -cq is ignored and the 2 Mbps default comes back.
+    return base + (['-cq', '21', '-b:v', '0'] if gpu else ['-crf', '20'])
+
+
+def audio_encoder_args(video_file):
+    """-c:a flags that leave the source audio alone whenever MP4 allows it."""
+    codec = _ffprobe(video_file, '-select_streams', 'a:0', '-show_entries', 'stream=codec_name')
+    if codec in _MP4_SAFE_AUDIO:
+        return ['-c:a', 'copy']
+    return ['-c:a', 'aac', '-b:a', '192k']
+
 def _fixed_bar(cfg, height):
     """Bar geometry from the static ratios in config."""
     height_ratio = float(cfg.get("height_ratio", 0.10))
@@ -189,12 +258,11 @@ def merge_subtitles_to_video():
     )
 
     ffmpeg_cmd = ['ffmpeg', '-i', video_file, '-vf', ",".join(filters).encode('utf-8')]
-
-    ffmpeg_gpu = load_key("ffmpeg_gpu")
-    if ffmpeg_gpu:
-        rprint("[bold green]will use GPU acceleration.[/bold green]")
-        ffmpeg_cmd.extend(['-c:v', 'h264_nvenc'])
-    ffmpeg_cmd.extend(['-y', OUTPUT_VIDEO])
+    ffmpeg_cmd.extend(video_encoder_args(video_file))
+    ffmpeg_cmd.extend(audio_encoder_args(video_file))
+    # moov at the front, so a multi-GB result seeks instantly instead of making
+    # the player read the tail first.
+    ffmpeg_cmd.extend(['-movflags', '+faststart', '-y', OUTPUT_VIDEO])
 
     rprint("🎬 Start merging subtitles to video...")
     start_time = time.time()
