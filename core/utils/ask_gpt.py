@@ -40,6 +40,23 @@ def _load_cache(prompt, resp_type, log_title):
 # ask gpt once
 # ------------
 
+def _unwrap_json_resp(resp, valid_def):
+    """Some models reply with several ```json blocks or a JSON array, and
+    json_repair turns that into a list. Pick the element that fits."""
+    if not isinstance(resp, list):
+        return resp
+    candidates = [item for item in resp if isinstance(item, dict)]
+    if not candidates:
+        return resp
+    if valid_def:
+        for item in candidates:
+            try:
+                if valid_def(item)['status'] == 'success':
+                    return item
+            except Exception:
+                continue
+    return candidates[0]
+
 @except_handler("GPT request failed", retry=5)
 def ask_gpt(prompt, resp_type=None, valid_def=None, log_title="default"):
     if not load_key("api.key"):
@@ -72,13 +89,17 @@ def ask_gpt(prompt, resp_type=None, valid_def=None, log_title="default"):
     # process and return full result
     resp_content = resp_raw.choices[0].message.content
     if resp_type == "json":
-        resp = json_repair.loads(resp_content)
+        resp = _unwrap_json_resp(json_repair.loads(resp_content), valid_def)
     else:
         resp = resp_content
-    
+
     # check if the response format is valid
     if valid_def:
-        valid_resp = valid_def(resp)
+        try:
+            valid_resp = valid_def(resp)
+        except Exception as e:
+            # the model returned something that is not the expected object at all
+            valid_resp = {"status": "error", "message": f"Unexpected response shape ({type(resp).__name__}): {e}"}
         if valid_resp['status'] != 'success':
             _save_cache(model, prompt, resp_content, resp_type, resp, log_title="error", message=valid_resp['message'])
             raise ValueError(f"❎ API response error: {valid_resp['message']}")
