@@ -1,14 +1,23 @@
 import os
 import glob
 from core._1_ytdlp import find_media_file
+from core.utils.models import _TEXT_DONE_MARKER, _AUDIO_DONE_MARKER
+from core.utils.project_store import RENDERED_OUTPUTS
 import shutil
 
-def cleanup(history_dir="history"):
+def cleanup(history_dir="history", keep_rendered=True):
+    """Move ``output/`` into ``history/<video name>/``.
+
+    With ``keep_rendered=False`` the burnt-in videos are dropped instead of
+    archived. They are the largest files by far and one "burn subtitles into the
+    video only" re-run rebuilds them from the .srt files that *are* archived, so
+    leaving them out is what makes an archive cheap enough to keep around.
+    """
     # Get input media file name
     media_file, _ = find_media_file()
     video_name = os.path.splitext(os.path.basename(media_file))[0]
     video_name = sanitize_filename(video_name)
-    
+
     # Create required folders
     os.makedirs(history_dir, exist_ok=True)
     video_history_dir = os.path.join(history_dir, video_name)
@@ -19,6 +28,15 @@ def cleanup(history_dir="history"):
 
     # Move non-log files
     for file in glob.glob("output/*"):
+        if os.path.basename(file) in RENDERED_OUTPUTS and not keep_rendered:
+            # Deleted rather than left behind, so the empty-output rmdir below
+            # still succeeds and the next project starts from a clean slate.
+            try:
+                os.remove(file)
+                print(f"🗑️ Dropped rendered video: {file}")
+            except OSError as e:
+                print(f"⚠️ Could not delete {file}: {e}")
+            continue
         if not file.endswith(('log', 'gpt_log')):
             move_file(file, video_history_dir)
 
@@ -30,6 +48,15 @@ def cleanup(history_dir="history"):
     for file in glob.glob("output/gpt_log/*"):
         move_file(file, gpt_log_dir)
 
+    # Done markers are dotfiles, which the globs above skip. Delete them rather
+    # than archive them: leaving one behind keeps "output" alive and makes the
+    # next video look like its subtitles were already generated.
+    for marker in (_TEXT_DONE_MARKER, _AUDIO_DONE_MARKER):
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+
     # Delete empty output directories
     try:
         os.rmdir("output/log")
@@ -37,6 +64,8 @@ def cleanup(history_dir="history"):
         os.rmdir("output")
     except OSError:
         pass  # Ignore errors when deleting directories
+
+    return video_history_dir
 
 def move_file(src, dst):
     try:

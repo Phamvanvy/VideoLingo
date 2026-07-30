@@ -194,6 +194,28 @@ def _rerun_controls(runner):
             st.rerun()
 
 
+def _archive_controls(scope: str):
+    """Archive the project to ``history/`` so it can be reloaded later.
+
+    The rendered video is left out by default: it is the largest file in the
+    project and one "burn subtitles only" re-run rebuilds it from the .srt files
+    that do get archived, which is the whole point of keeping the archive small
+    enough to hold on to.
+    """
+    keep_rendered = st.checkbox(
+        t("Keep the rendered video in the archive"),
+        value=False,
+        key=f"archive_keep_rendered_{scope}",
+        help=t(
+            "Off by default. The burnt-in video is the largest file in the project "
+            "and can be rebuilt from the archived subtitles with a single re-burn."
+        ),
+    )
+    if st.button(t("Archive to 'history'"), key=f"cleanup_in_{scope}_processing"):
+        cleanup(keep_rendered=keep_rendered)
+        st.rerun()
+
+
 def _subtitle_length_controls():
     """Render inline controls for the two subtitle-length tunables.
 
@@ -310,10 +332,7 @@ def text_processing_section():
             download_subtitle_zip_button(text=t("Download All Srt Files"))
 
             _rerun_controls(runner)
-
-            if st.button(t("Archive to 'history'"), key="cleanup_in_text_processing"):
-                cleanup()
-                st.rerun()
+            _archive_controls("text")
             return True
 
 
@@ -392,9 +411,7 @@ def audio_processing_section():
                 _clear_path(_AUDIO_DONE_MARKER)
                 delete_dubbing_files()
                 st.rerun()
-            if st.button(t("Archive to 'history'"), key="cleanup_in_audio_processing"):
-                cleanup()
-                st.rerun()
+            _archive_controls("audio")
 
 
 # ─── Main ───

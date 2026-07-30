@@ -6,6 +6,7 @@ from time import sleep
 import streamlit as st
 from core._1_ytdlp import download_video_ytdlp, find_media_file, write_input_manifest
 from core.utils import *
+from core.utils.project_store import list_projects, project_status, restore_project
 from translations.translations import translate as t
 
 OUTPUT_DIR = "output"
@@ -61,6 +62,50 @@ def _inject_file_uploader_i18n():
         """,
         unsafe_allow_html=True,
     )
+
+def _load_project_section():
+    """Reload a project archived to ``history/`` instead of starting over.
+
+    An archive carries the whole text half of the pipeline -- transcription,
+    segmentation, translation -- so restoring one and then picking "Burn
+    subtitles into the video only" in the re-run panel renders the video again
+    without paying for Whisper or the LLM a second time.
+    """
+    projects = list_projects()
+    if not projects:
+        return
+
+    with st.expander(t("Load project from history"), expanded=False):
+        st.caption(
+            t(
+                "Restores an archived project into `output/`, subtitles and all. "
+                "To render the video again, open \"Re-run part of the pipeline\" and "
+                "choose to burn the subtitles in — nothing is transcribed or translated twice."
+            )
+        )
+        name = st.selectbox(t("Archived project"), projects, key="history_project")
+        status = project_status(name)
+
+        if not status["restorable"]:
+            reason = (
+                t("no source media file in the archive")
+                if not status["media"]
+                else t("missing {files}").replace("{files}", ", ".join(status["missing"]))
+            )
+            st.warning(
+                t("This project cannot be loaded: {reason}").replace("{reason}", reason)
+            )
+            return
+
+        if status["has_rendered"]:
+            st.caption(t("This archive still contains the rendered video."))
+
+        if st.button(t("Load project"), key="load_project_button", width="stretch"):
+            with st.spinner(t("Restoring project...")):
+                restore_project(name)
+            st.session_state.pop("_processed_upload_id", None)
+            st.rerun()
+
 
 def download_video_section():
     st.header(t("a. Download or Upload Video"))
@@ -141,5 +186,6 @@ def download_video_section():
 
             st.session_state["_processed_upload_id"] = upload_id
             st.rerun()
-        else:
-            return False
+
+        _load_project_section()
+        return False
