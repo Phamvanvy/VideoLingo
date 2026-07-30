@@ -1,4 +1,4 @@
-import os, subprocess, time
+import os, re, subprocess, time
 from core._1_ytdlp import find_video_files
 import cv2
 import numpy as np
@@ -120,6 +120,91 @@ def audio_encoder_args(video_file):
         return ['-c:a', 'copy']
     return ['-c:a', 'aac', '-b:a', '192k']
 
+_SRT_TIME_RE = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
+)
+
+
+def _srt_time_ranges(srt_path):
+    """(start, end) seconds for every cue in an SRT file, in file order."""
+    try:
+        with open(srt_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return []
+
+    def to_seconds(h, m, s, ms):
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+    ranges = []
+    for h1, m1, s1, ms1, h2, m2, s2, ms2 in _SRT_TIME_RE.findall(content):
+        start, end = to_seconds(h1, m1, s1, ms1), to_seconds(h2, m2, s2, ms2)
+        if end > start:
+            ranges.append((start, end))
+    return ranges
+
+
+def _merge_ranges(ranges, gap):
+    """Sorted ranges with anything closer together than `gap` fused into one."""
+    merged = [ranges[0]]
+    for start, end in ranges[1:]:
+        last_start, last_end = merged[-1]
+        if start - last_end <= gap:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+# One `between(t,...)` term costs ~30 characters, and the whole filter chain has
+# to fit in a single command-line argument (Windows caps the command line at
+# 32767 characters). Staying well under that leaves room for the rest of the
+# chain no matter how long the video is.
+MAX_ENABLE_SEGMENTS = 300
+# Gaps tried in order until the segment count fits the budget. A feature-length
+# video has thousands of cues, so instead of giving up on gating it the bar is
+# simply held on across the shorter pauses -- it still switches off through
+# intros, music and any long stretch with no dialogue at all.
+MERGE_GAPS = (0.35, 1.0, 2.0, 5.0, 10.0, 20.0, 45.0, 90.0)
+
+
+def _cover_enable_expr(srt_paths, cfg, pad=0.15):
+    """ffmpeg `enable` expression covering only the time subtitles are on screen,
+    so the bar does not sit over the picture between lines.
+
+    Every SRT that matters is unioned together: the source timing decides when
+    the burned-in subtitles need covering, and the timing of the replacement
+    line decides when it needs the bar behind it -- dubbing shifts the latter
+    away from the former. Ranges are padded slightly because the hardcoded
+    subtitles' fade in/out rarely lines up to the millisecond with the
+    transcript timing them.
+    """
+    if not cfg.get("time_gate", True):
+        return None
+
+    ranges = []
+    for path in srt_paths:
+        ranges.extend(_srt_time_ranges(path))
+    if not ranges:
+        rprint("[bold yellow]⚠️ No subtitle timings found; the cover bar stays on "
+               "for the whole video.[/bold yellow]")
+        return None
+
+    padded = sorted((max(0.0, s - pad), e + pad) for s, e in ranges)
+    for gap in MERGE_GAPS:
+        merged = _merge_ranges(padded, gap)
+        if len(merged) <= MAX_ENABLE_SEGMENTS:
+            if gap != MERGE_GAPS[0]:
+                rprint(f"[bold yellow]⚠️ {len(padded)} subtitle cues is too many to gate "
+                       f"the cover bar one by one; holding it on across gaps shorter "
+                       f"than {gap:g}s ({len(merged)} segments).[/bold yellow]")
+            return "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in merged)
+
+    rprint("[bold yellow]⚠️ Subtitles are too dense to gate the cover bar; "
+           "leaving it on for the whole video.[/bold yellow]")
+    return None
+
+
 def _fixed_bar(cfg, height):
     """Bar geometry from the static ratios in config."""
     height_ratio = float(cfg.get("height_ratio", 0.10))
@@ -155,24 +240,29 @@ def trans_backdrop_style(has_cover_bar):
     return "BorderStyle=1"
 
 
-def build_cover_bar(width, height, video_file=None, single_line=False):
-    """Black bar hiding subtitles already burned into the source video.
+def build_cover_bar(width, height, video_file=None, single_line=False, text_srt=None):
+    """Bar hiding subtitles already burned into the source video.
 
     Returns the drawbox filter (or None), the MarginV and the FontSize to use
     for the translated subtitles. In "auto" mode the band is detected from the
     video itself; detection failures fall back to the fixed ratios in config.
+    ``text_srt`` is the subtitle file actually being burned, when its timing
+    differs from the source transcript's -- the bar has to be up for both.
     """
     cfg = load_key_safe("cover_hardcoded_subtitles") or {}
     if not cfg.get("enable"):
         return None, TRANS_MARGIN_V, TRANS_FONT_SIZE
 
     y = bar_height = text_height = None
+    bar_x, bar_width = 0, width
     if cfg.get("mode", "auto") == "auto" and video_file:
         from core.utils.hardsub_detect import detect_subtitle_band
-        band = detect_subtitle_band(video_file, height, cfg.get("detection") or {})
+        band = detect_subtitle_band(video_file, width, height, cfg.get("detection") or {})
         if band:
             y, bar_height = band["y"], band["height"]
             text_height = band.get("text_height")
+            if cfg.get("limit_bar_width", True):
+                bar_x, bar_width = band["x"], band["width"]
             rprint(f"[bold green]🔍 Detected hardcoded subtitles at y={y} "
                    f"({bar_height}px tall, {text_height}px of glyphs, "
                    f"confidence {band['confidence']}).[/bold green]")
@@ -182,9 +272,16 @@ def build_cover_bar(width, height, video_file=None, single_line=False):
     if y is None:
         y, bar_height = _fixed_bar(cfg, height)
 
-    drawbox = f"drawbox=x=0:y={y}:w={width}:h={bar_height}:color=black@1.0:t=fill"
-    rprint(f"[bold green]🩹 Covering hardcoded subtitles with a {bar_height}px black bar "
-           f"({bar_height / height:.1%} of the frame).[/bold green]")
+    bar_color = cfg.get("color", "black")
+    bar_opacity = float(cfg.get("opacity", 1.0))
+    drawbox = f"drawbox=x={bar_x}:y={y}:w={bar_width}:h={bar_height}:color={bar_color}@{bar_opacity}:t=fill"
+    gate_srts = [SRC_SRT] + ([text_srt] if text_srt else [])
+    enable_expr = _cover_enable_expr(gate_srts, cfg)
+    if enable_expr:
+        drawbox += f":enable='{enable_expr}'"
+    rprint(f"[bold green]🩹 Covering hardcoded subtitles with a {bar_width}x{bar_height}px "
+           f"{bar_color}@{bar_opacity} bar ({bar_height / height:.1%} of the frame height)"
+           f"{' (only while a subtitle is on screen)' if enable_expr else ''}.[/bold green]")
 
     # The translated subtitles always render near the bottom of the frame, so a
     # bar detected in the upper half (subtitles burned at the top) must not drag
@@ -236,7 +333,9 @@ def merge_subtitles_to_video():
     TARGET_HEIGHT = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
-    cover_bar, trans_margin_v, trans_font_size = build_cover_bar(TARGET_WIDTH, TARGET_HEIGHT, video_file)
+    cover_bar, trans_margin_v, trans_font_size = build_cover_bar(
+        TARGET_WIDTH, TARGET_HEIGHT, video_file, text_srt=TRANS_SRT
+    )
 
     filters = [
         f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease",

@@ -63,9 +63,11 @@ def merge_video_audio():
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
     
-    # only dub.srt is burned here, so the bar must center a single line
+    # only dub.srt is burned here, so the bar must center a single line -- and
+    # it has to stay up through the dubbed timings too, which drift from the
+    # source transcript as segments are stretched to fit the generated speech
     cover_bar, trans_margin_v, trans_font_size = build_cover_bar(
-        TARGET_WIDTH, TARGET_HEIGHT, VIDEO_FILE, single_line=True
+        TARGET_WIDTH, TARGET_HEIGHT, VIDEO_FILE, single_line=True, text_srt=DUB_SUB_FILE
     )
 
     subtitle_filter = (

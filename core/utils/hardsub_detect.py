@@ -1,9 +1,10 @@
-"""Locate the row band occupied by subtitles already burned into a video.
+"""Locate the row band and column extent occupied by subtitles already burned
+into a video.
 
-The cover applied downstream is a full-width ffmpeg ``drawbox``, so only the
-vertical extent matters -- no OCR, no per-character boxes. Detection samples
-frames, measures how "text-like" every pixel row looks, and picks the band that
-is both strong in absolute terms and clearly above the rest of the frame.
+The cover applied downstream is an ffmpeg ``drawbox`` sized to the detected
+band -- no OCR, no per-character boxes. Detection samples frames, measures how
+"text-like" every pixel row/column looks, and picks the band that is both
+strong in absolute terms and clearly above the rest of the frame.
 """
 
 import json
@@ -16,7 +17,7 @@ from core.utils import rprint
 
 # Bump whenever the algorithm or the constants below change, so cached results
 # from an older detector are recomputed instead of silently reused.
-DETECTOR_VERSION = 4
+DETECTOR_VERSION = 6
 
 CACHE_FILE = "output/log/hardsub_region.json"
 DEBUG_IMAGE = "output/log/hardsub_debug.png"
@@ -65,6 +66,28 @@ CONTRAST_REF = 3.0
 # peak score reaches this share of the band's own peak.
 TEXT_CORE_RATIO = 0.5
 
+# --- Horizontal extent -------------------------------------------------------
+# Share of a band's rows a column must light up, in one frame, to count as
+# carrying text there. Kept separate from (and below) the row threshold: a bar
+# that ends up too narrow leaves the old subtitles peeking out the sides, which
+# is worse than one that is slightly too wide.
+COL_ACTIVE_THRESH = 0.10
+# Share of the frame width the column profile is smoothed over, to close the
+# gaps between strokes and words, and the gap bridged when grouping runs.
+COL_SMOOTH_RATIO = 0.015
+COL_BRIDGE_RATIO = 0.04
+# How often a column has to carry text before it counts as part of the line:
+# an absolute floor, and a multiple of the background level of the same profile.
+# Lines vary in length, so the floor stays low enough to keep the ends of the
+# longer ones -- `width_padding_ratio` in config then adds the final margin.
+COL_PRESENCE_FLOOR = 0.15
+COL_BG_MULTIPLIER = 2.5
+# Runs narrower than this share of the frame are background speckle, not a line.
+COL_MIN_RUN_RATIO = 0.02
+# Below this many frames carrying text the extent is not measured at all and the
+# bar falls back to the full frame width.
+MIN_TEXT_FRAMES = 5
+
 
 def _sample_gray_frames(cap, sample_frames):
     """Evenly sampled grayscale frames, downscaled to WORK_WIDTH."""
@@ -106,6 +129,13 @@ def _row_scores(gray):
     margin = int(gray.shape[1] * SIDE_MARGIN_RATIO)
     core = sobel[:, margin:gray.shape[1] - margin]
     return (core > EDGE_THRESH).mean(axis=1)
+
+
+def _col_scores(gray, top, bottom):
+    """Per-column fraction of rows, within a row band, carrying a strong vertical edge."""
+    sobel = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    band = sobel[top:bottom + 1, :]
+    return (band > EDGE_THRESH).mean(axis=0)
 
 
 def _smooth(arr, window=3):
@@ -164,6 +194,53 @@ def _text_core(peak, top, bottom):
     return top + int(rows[0]), top + int(rows[-1])
 
 
+def _text_columns(grays, top, bottom, text_frames):
+    """Left/right bounds of the columns the subtitles occupy within a row band.
+
+    Neither "every column ever active" nor a trimmed per-frame extent survives
+    detailed footage: background inside the band lights up columns right out to
+    the frame edges in *every* frame, so there is no outlier to trim. What
+    separates the two is repetition -- the subtitles sit in the same columns
+    every time they appear, while background detail moves. So each column is
+    scored by how often it carries text across the frames that have any, and the
+    level of the frame's own background sets the bar it has to clear.
+    """
+    work_w = grays[0].shape[1]
+    hits = np.zeros(work_w)
+    frames_used = 0
+    for gray, has_text in zip(grays, text_frames):
+        if not has_text:
+            continue
+        hits += _col_scores(gray, top, bottom) >= COL_ACTIVE_THRESH
+        frames_used += 1
+    if frames_used < MIN_TEXT_FRAMES:
+        return None
+
+    # Glyphs only produce edges at their strokes, so a raw column profile is a
+    # comb with gaps between strokes and words. Smoothing (over an odd window, to
+    # keep the profile aligned with the column index) turns a line of text into
+    # the one plateau the extent is then measured from.
+    presence = _smooth(hits / frames_used,
+                       window=max(3, int(COL_SMOOTH_RATIO * work_w) | 1))
+    margin = int(work_w * SIDE_MARGIN_RATIO)
+    presence[:margin] = 0.0
+    presence[work_w - margin:] = 0.0
+
+    # A centred line leaves most columns as background, so the median is a fair
+    # estimate of it -- the same trick the row threshold uses.
+    thresh = max(COL_PRESENCE_FLOOR, COL_BG_MULTIPLIER * float(np.median(presence)))
+    groups = _group_bands(presence >= thresh, max(2, int(COL_BRIDGE_RATIO * work_w)))
+    groups = [g for g in groups if (g[1] - g[0] + 1) >= COL_MIN_RUN_RATIO * work_w]
+    if not groups:
+        return None
+    # The text is the strongest run; stray background runs that cleared the
+    # threshold are not allowed to drag the edges outwards.
+    left, right = max(groups, key=lambda g: presence[g[0]:g[1] + 1].sum())
+    if right <= left:
+        return None
+    return int(left), int(right)
+
+
 def _analyze(grays, cfg):
     """Score every candidate band; return the best one in work-resolution rows."""
     scores = np.array([_row_scores(g) for g in grays])  # (n_frames, work_h)
@@ -195,6 +272,10 @@ def _analyze(grays, cfg):
     band_strength = float(strength[top:bottom + 1].mean())
     median_row_score = float(np.median(row_score))
     core_top, core_bottom = _text_core(peak, top, bottom)
+    # Same "is a subtitle on screen" test the row logic uses for presence, but
+    # per frame rather than averaged, so only frames showing text are measured.
+    text_frames = scores[:, core_top:core_bottom + 1].mean(axis=1) >= active_thresh
+    col_bounds = _text_columns(grays, top, bottom, text_frames)
 
     abs_conf = float(np.clip(band_strength / ABS_STRENGTH_REF, 0.0, 1.0))
     ratio = band_row_score / max(median_row_score, 1e-6)
@@ -211,8 +292,10 @@ def _analyze(grays, cfg):
         "active_thresh": round(active_thresh, 4),
         "work_height": work_h,
         "core_rows": [core_top, core_bottom],
+        "col_bounds": col_bounds,
+        "text_frames": int(text_frames.sum()),
     }
-    return (top, bottom, confidence, core_top, core_bottom), stats
+    return (top, bottom, confidence, core_top, core_bottom, col_bounds), stats
 
 
 def _cache_key(video_path, cfg):
@@ -253,13 +336,16 @@ def _write_cache(key, value):
         pass  # caching is an optimisation, never a failure
 
 
-def detect_subtitle_band(video_path, height, cfg=None, use_cache=True):
+def detect_subtitle_band(video_path, width, height, cfg=None, use_cache=True):
     """Row band of hardcoded subtitles, in full-resolution coordinates.
 
-    Returns ``{"y", "height", "text_height", "confidence"}`` or None when nothing
-    is found confidently enough, in which case the caller should fall back to
-    fixed ratios. ``height`` spans everything that must be covered; the smaller
-    ``text_height`` is the glyph height the replacement subtitles should match.
+    Returns ``{"y", "height", "text_height", "x", "width", "confidence"}`` or
+    None when nothing is found confidently enough, in which case the caller
+    should fall back to fixed ratios. ``y``/``height`` span everything that must
+    be covered vertically; ``x``/``width`` are the horizontal extent of the text
+    rather than the full frame width, measured from where text repeatedly
+    appears and widened by ``width_padding_ratio``. The smaller ``text_height``
+    is the glyph height the replacement subtitles should match.
     """
     cfg = cfg or {}
     key = _cache_key(video_path, cfg)
@@ -286,18 +372,29 @@ def detect_subtitle_band(video_path, height, cfg=None, use_cache=True):
 
     band = None
     if result is not None:
-        top, bottom, confidence, core_top, core_bottom = result
+        top, bottom, confidence, core_top, core_bottom, col_bounds = result
         if confidence >= min_confidence:
             work_h = stats["work_height"]
             pad = int(float(cfg.get("padding_ratio", 0.006)) * work_h)
             top = max(0, top - pad)
             bottom = min(work_h - 1, bottom + pad)
-            scale = height / work_h
-            y = int(round(top * scale))
+            scale_y = height / work_h
+            y = int(round(top * scale_y))
+
+            work_w = WORK_WIDTH
+            left, right = col_bounds if col_bounds else (0, work_w - 1)
+            col_pad = int(float(cfg.get("width_padding_ratio", 0.03)) * work_w)
+            left = max(0, left - col_pad)
+            right = min(work_w - 1, right + col_pad)
+            scale_x = width / work_w
+            x = int(round(left * scale_x))
+
             band = {
                 "y": max(0, y),
-                "height": max(1, min(height - y, int(round((bottom - top + 1) * scale)))),
-                "text_height": max(1, int(round((core_bottom - core_top + 1) * scale))),
+                "height": max(1, min(height - y, int(round((bottom - top + 1) * scale_y)))),
+                "text_height": max(1, int(round((core_bottom - core_top + 1) * scale_y))),
+                "x": max(0, x),
+                "width": max(1, min(width - x, int(round((right - left + 1) * scale_x)))),
                 "confidence": round(confidence, 3),
             }
         else:
@@ -319,17 +416,18 @@ def _preview_frame(sample, band, height):
 
     cfg = load_key("cover_hardcoded_subtitles") or {}
     y, bar_h = band["y"], band["height"]
+    x, bar_w = band.get("x", 0), band.get("width", sample.shape[1])
     # Darkened rather than filled: burning paints it solid black, but the point
     # of the preview is to see whether the old text falls inside the bar.
-    sample[y:y + bar_h, :] = (sample[y:y + bar_h, :] * 0.35).astype(sample.dtype)
+    sample[y:y + bar_h, x:x + bar_w] = (sample[y:y + bar_h, x:x + bar_w] * 0.35).astype(sample.dtype)
 
     font_size = _matched_font_size(band["text_height"], height, cfg)
     em_px = round(font_size / PLAY_RES_Y * height)
     center = y + bar_h // 2
     top, bottom = center - em_px // 2, center + em_px // 2
-    cv2.rectangle(sample, (0, top), (sample.shape[1] - 1, bottom), (0, 255, 255), 2)
-    cv2.rectangle(sample, (0, y), (sample.shape[1] - 1, y + bar_h - 1), (0, 0, 255), 2)
-    print(f"bar            : {bar_h}px ({bar_h / height:.1%} of the frame)")
+    cv2.rectangle(sample, (x, top), (x + bar_w - 1, bottom), (0, 255, 255), 2)
+    cv2.rectangle(sample, (x, y), (x + bar_w - 1, y + bar_h - 1), (0, 0, 255), 2)
+    print(f"bar            : {bar_w}x{bar_h}px ({bar_h / height:.1%} of the frame height)")
     print(f"matched font   : FontSize={font_size} -> {em_px}px em "
           f"vs {band['text_height']}px of source glyphs")
     return sample
@@ -340,6 +438,7 @@ def _debug_main(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise SystemExit(f"Could not open {video_path}")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     grays = _sample_gray_frames(cap, 100)
     cap.release()
@@ -351,7 +450,7 @@ def _debug_main(video_path):
     print(f"frames sampled : {len(grays)}")
     print(f"stats          : {json.dumps(stats, indent=2)}")
 
-    band = detect_subtitle_band(video_path, height, use_cache=False)
+    band = detect_subtitle_band(video_path, width, height, use_cache=False)
     print(f"band           : {band}")
     if not band:
         return
