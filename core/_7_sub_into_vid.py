@@ -1,4 +1,4 @@
-import os, re, subprocess, time
+import math, os, re, subprocess, time
 from core._1_ytdlp import find_video_files
 import cv2
 import numpy as np
@@ -144,6 +144,30 @@ def _srt_time_ranges(srt_path):
     return ranges
 
 
+def _srt_cues(srt_path):
+    """(start, end, text) for every cue in an SRT file, in file order."""
+    try:
+        with open(srt_path, "r", encoding="utf-8") as f:
+            content = f.read().replace("\r\n", "\n")
+    except OSError:
+        return []
+
+    cues = []
+    for block in re.split(r"\n\s*\n", content):
+        lines = [line for line in block.split("\n") if line.strip()]
+        for i, line in enumerate(lines):
+            match = _SRT_TIME_RE.search(line)
+            if not match:
+                continue
+            h1, m1, s1, ms1, h2, m2, s2, ms2 = match.groups()
+            start = int(h1) * 3600 + int(m1) * 60 + int(s1) + int(ms1) / 1000
+            end = int(h2) * 3600 + int(m2) * 60 + int(s2) + int(ms2) / 1000
+            if end > start:
+                cues.append((start, end, " ".join(lines[i + 1:]).strip()))
+            break
+    return cues
+
+
 def _merge_ranges(ranges, gap):
     """Sorted ranges with anything closer together than `gap` fused into one."""
     merged = [ranges[0]]
@@ -227,6 +251,182 @@ def _matched_font_size(text_height, height, cfg):
     return int(min(hi, max(lo, size)))
 
 
+# PlayResX of the style ffmpeg builds when it converts an srt to ass, and the
+# side margins of that style -- together they set the width libass wraps at.
+PLAY_RES_X = 384
+ASS_SIDE_MARGIN = 10
+
+# Every bar costs ~90 characters of the one command-line argument the whole
+# filter chain has to fit in (Windows caps that at 32767), and the subtitle
+# filters come after it. Overrunning this budget falls back to the static bar.
+MAX_BAR_CHARS = 16000
+# Measured widths wobble by a few pixels between one sample and the next, which
+# would cut the timeline into a separate bar per sample. Rounding up to a grid
+# makes a steady line one bar; the coarser steps are there for a video whose
+# lines change often enough that the fine grid overruns the budget above.
+WIDTH_QUANTA = (32, 64, 128, 256)
+# Pieces shorter than this are absorbed into the bar before them: at a fifth of
+# a second a width change is a flicker, not something the eye reads as a bar.
+MIN_BAR_SEGMENT = 0.4
+
+_FONT_FILES = {"Windows": "arial.ttf", "Darwin": "Arial Unicode.ttf",
+               "Linux": "NotoSansCJK-Regular.ttc"}
+_font_cache = {}
+
+
+def _text_measurer(em_px):
+    """Callable giving the pixel width a string renders to at this em size.
+
+    Taken from the real font file when it can be loaded, so the bar matches what
+    libass will actually draw; the fallback assumes the average Latin glyph is
+    half an em wide and a CJK one a full em.
+    """
+    px = max(1, int(round(em_px)))
+    if px not in _font_cache:
+        try:
+            from PIL import ImageFont
+            _font_cache[px] = ImageFont.truetype(
+                _FONT_FILES.get(platform.system(), "arial.ttf"), px)
+        except Exception:
+            _font_cache[px] = None
+    font = _font_cache[px]
+    if font is not None:
+        return lambda text: float(font.getlength(text))
+    return lambda text: sum(1.0 if ord(c) > 0x2E80 else 0.5 for c in text) * px
+
+
+def _rendered_text_width(text, font_size, height, max_width):
+    """Width of the widest line libass draws for `text`, wrapping included."""
+    measure = _text_measurer(font_size / PLAY_RES_Y * height)
+    lines, current = [], ""
+    for word in text.split():
+        trial = f"{current} {word}" if current else word
+        if current and measure(trial) > max_width:
+            lines.append(current)
+            current = word
+        else:
+            current = trial
+    lines.append(current)
+    return min(max_width, max(measure(line) for line in lines))
+
+
+def _drawbox(x, y, w, h, color, opacity, gate=None):
+    box = f"drawbox=x={x}:y={y}:w={w}:h={h}:color={color}@{opacity}:t=fill"
+    return box + (f":enable='{gate}'" if gate else "")
+
+
+def _width_requirements(video_file, y, bar_height, width, height, cfg,
+                        text_srt, font_size, text_in_bar, pad=0.15):
+    """(start, end, width) stretches the cover bar has to satisfy.
+
+    Two things have to fit inside it. The burned-in line it hides is measured
+    from the video on a fixed grid, and each sample claims a full step either
+    side of itself, so a line whose text starts or ends between two samples is
+    still covered and a single missed sample cannot punch a hole in the middle
+    of a line. The replacement line is added on top of that whenever it is drawn
+    inside the bar rather than below it -- there the bar is also its backdrop,
+    and a backdrop narrower than the text it sits behind looks like a mistake.
+    """
+    from core.utils.hardsub_detect import SPAN_STEP, measure_span_timeline
+
+    items = []
+    timeline = measure_span_timeline(video_file, y, bar_height)
+    center = width / 2
+    side_pad = float(cfg.get("width_padding_ratio", 0.03)) * width
+    for t, span in timeline:
+        if span:
+            # The bar stays centred on the frame, like the text drawn on it, so
+            # it has to reach whichever side of the measured line is further out.
+            needed = 2 * (max(center - span[0], span[1] - center) + side_pad)
+            items.append((t - SPAN_STEP, t + SPAN_STEP, needed))
+
+    if not items:
+        return None
+
+    if text_srt and text_in_bar:
+        wrap_width = width - 2 * ASS_SIDE_MARGIN / PLAY_RES_X * width
+        pad_px = 2 * float(cfg.get("line_width_padding_em", 0.6)) * font_size / PLAY_RES_Y * height
+        for start, end, text in _srt_cues(text_srt):
+            drawn = _rendered_text_width(text, font_size, height, wrap_width)
+            items.append((start - pad, end + pad, drawn + pad_px))
+    return items
+
+
+def _bar_intervals(items, quantum, max_width):
+    """Requirements resolved into disjoint (start, end, width) intervals.
+
+    Neighbouring stretches must not be fused -- that would hand the shorter line
+    the width of the longer one, which is the whole thing being avoided here. So
+    the timeline is cut at every requirement boundary instead, and each piece
+    takes the widest requirement covering it, rounded up to the quantum: where
+    two lines overlap the bar spans both rather than cropping either.
+    """
+    bounds = sorted({t for start, end, _ in items for t in (start, end)})
+    intervals = []
+    for left, right in zip(bounds, bounds[1:]):
+        active = [needed for start, end, needed in items if start < right and end > left]
+        if not active:
+            continue
+        width = min(max_width, int(math.ceil(max(active) / quantum) * quantum))
+        if intervals and intervals[-1][1] >= left and intervals[-1][2] == width:
+            intervals[-1][1] = right  # same width as the piece before it
+        else:
+            intervals.append([left, right, width])
+    return intervals
+
+
+def _absorb_short(intervals, min_length=MIN_BAR_SEGMENT):
+    """Slivers folded into the bar before them, at the wider of the two widths."""
+    kept = []
+    for start, end, width in intervals:
+        # Only into the bar it touches: absorbing across a gap would hold the bar
+        # up over a stretch that has nothing to cover.
+        touches = bool(kept) and start - kept[-1][1] < 1e-6
+        if touches and end - start < min_length:
+            kept[-1][1] = end
+            kept[-1][2] = max(kept[-1][2], width)
+        elif touches and kept[-1][2] == width:
+            kept[-1][1] = end
+        else:
+            kept.append([start, end, width])
+    return kept
+
+
+def _measured_bars(video_file, y, bar_height, width, height, cfg, text_srt, font_size,
+                   text_in_bar, color, opacity):
+    """One bar per stretch of subtitle, each only as wide as the text under it.
+
+    Returns the comma-joined drawbox chain, or None when nothing could be
+    measured or the result will not fit the command line, so the caller falls
+    back to the single bar sized to the longest line in the whole video.
+    """
+    items = _width_requirements(video_file, y, bar_height, width, height, cfg,
+                                text_srt, font_size, text_in_bar)
+    if not items:
+        rprint("[bold yellow]⚠️ Could not measure the subtitles line by line; using one "
+               "bar for the whole video.[/bold yellow]")
+        return None
+
+    for quantum in WIDTH_QUANTA:
+        intervals = _absorb_short(_bar_intervals(items, quantum, width))
+        boxes = [_drawbox((width - box_w) // 2, y, box_w, bar_height, color, opacity,
+                          f"between(t,{max(0.0, start):.3f},{end:.3f})")
+                 for start, end, box_w in intervals]
+        chain = ",".join(boxes)
+        if len(chain) <= MAX_BAR_CHARS:
+            widths = [box_w for _, _, box_w in intervals]
+            on_screen = sum(end - start for start, end, _ in intervals)
+            rprint(f"[bold green]🩹 Covering hardcoded subtitles with {len(boxes)} bars "
+                   f"sized to the line under them, {min(widths)}-{max(widths)}px wide "
+                   f"({bar_height}px tall, {color}@{opacity}, up {on_screen / 60:.1f} min "
+                   f"in total).[/bold green]")
+            return chain
+
+    rprint("[bold yellow]⚠️ The subtitle width changes too often to give every line its "
+           "own bar; using one bar for the whole video.[/bold yellow]")
+    return None
+
+
 def trans_backdrop_style(has_cover_bar):
     """force_style fragment deciding what sits behind the translated text.
 
@@ -243,11 +443,14 @@ def trans_backdrop_style(has_cover_bar):
 def build_cover_bar(width, height, video_file=None, single_line=False, text_srt=None):
     """Bar hiding subtitles already burned into the source video.
 
-    Returns the drawbox filter (or None), the MarginV and the FontSize to use
+    Returns the drawbox filters (or None), the MarginV and the FontSize to use
     for the translated subtitles. In "auto" mode the band is detected from the
     video itself; detection failures fall back to the fixed ratios in config.
-    ``text_srt`` is the subtitle file actually being burned, when its timing
-    differs from the source transcript's -- the bar has to be up for both.
+    The rows it covers are fixed for the whole video, but its width follows the
+    line under it -- see ``_measured_bars`` -- falling back to one bar as wide
+    as the longest line when that cannot be measured. ``text_srt`` is the
+    subtitle file actually being burned, when its timing differs from the source
+    transcript's: the bar has to be up for both.
     """
     cfg = load_key_safe("cover_hardcoded_subtitles") or {}
     if not cfg.get("enable"):
@@ -274,29 +477,38 @@ def build_cover_bar(width, height, video_file=None, single_line=False, text_srt=
 
     bar_color = cfg.get("color", "black")
     bar_opacity = float(cfg.get("opacity", 1.0))
-    drawbox = f"drawbox=x={bar_x}:y={y}:w={bar_width}:h={bar_height}:color={bar_color}@{bar_opacity}:t=fill"
-    gate_srts = [SRC_SRT] + ([text_srt] if text_srt else [])
-    enable_expr = _cover_enable_expr(gate_srts, cfg)
-    if enable_expr:
-        drawbox += f":enable='{enable_expr}'"
-    rprint(f"[bold green]🩹 Covering hardcoded subtitles with a {bar_width}x{bar_height}px "
-           f"{bar_color}@{bar_opacity} bar ({bar_height / height:.1%} of the frame height)"
-           f"{' (only while a subtitle is on screen)' if enable_expr else ''}.[/bold green]")
 
     # The translated subtitles always render near the bottom of the frame, so a
     # bar detected in the upper half (subtitles burned at the top) must not drag
     # them up there -- only a bar in the lower half dictates their position.
     bar_in_lower_half = (y + bar_height / 2) > height / 2
-    if not bar_in_lower_half or not (single_line or not load_key_safe("burn_src_subtitles", True)):
-        # two stacked lines, or a bar elsewhere: keep the default bottom position
-        return drawbox, TRANS_MARGIN_V, TRANS_FONT_SIZE
-
     # A single line goes inside the bar, so it can be sized to the text it hides.
+    text_in_bar = bar_in_lower_half and (single_line or not load_key_safe("burn_src_subtitles", True))
+
     font_size = TRANS_FONT_SIZE
-    if text_height and cfg.get("match_source_font_size", True):
+    if text_in_bar and text_height and cfg.get("match_source_font_size", True):
         font_size = _matched_font_size(text_height, height, cfg)
         rprint(f"[bold green]🔠 Matching the translated font to the source text: "
                f"FontSize={font_size}.[/bold green]")
+
+    drawbox = None
+    # A bar that is up for the whole video cannot follow the line under it, so
+    # the per-line widths only apply when the bar is allowed to switch off.
+    if cfg.get("per_line_width", True) and cfg.get("time_gate", True) and video_file:
+        drawbox = _measured_bars(video_file, y, bar_height, width, height, cfg, text_srt,
+                                 font_size, text_in_bar, bar_color, bar_opacity)
+    if drawbox is None:
+        gate_srts = [SRC_SRT] + ([text_srt] if text_srt else [])
+        enable_expr = _cover_enable_expr(gate_srts, cfg)
+        drawbox = _drawbox(bar_x, y, bar_width, bar_height, bar_color, bar_opacity, enable_expr)
+        rprint(f"[bold green]🩹 Covering hardcoded subtitles with a {bar_width}x{bar_height}px "
+               f"{bar_color}@{bar_opacity} bar ({bar_height / height:.1%} of the frame height)"
+               f"{' (only while a subtitle is on screen)' if enable_expr else ''}.[/bold green]")
+
+    if not text_in_bar:
+        # two stacked lines, or a bar elsewhere: keep the default bottom position
+        return drawbox, TRANS_MARGIN_V, TRANS_FONT_SIZE
+
     center_ratio = (height - (y + bar_height / 2)) / height
     margin_v = max(2, round(center_ratio * PLAY_RES_Y - font_size / 2))
     return drawbox, margin_v, font_size

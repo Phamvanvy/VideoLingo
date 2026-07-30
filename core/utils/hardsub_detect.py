@@ -9,6 +9,7 @@ strong in absolute terms and clearly above the rest of the frame.
 
 import json
 import os
+import zlib
 
 import cv2
 import numpy as np
@@ -17,7 +18,7 @@ from core.utils import rprint
 
 # Bump whenever the algorithm or the constants below change, so cached results
 # from an older detector are recomputed instead of silently reused.
-DETECTOR_VERSION = 6
+DETECTOR_VERSION = 7
 
 CACHE_FILE = "output/log/hardsub_region.json"
 DEBUG_IMAGE = "output/log/hardsub_debug.png"
@@ -87,6 +88,32 @@ COL_MIN_RUN_RATIO = 0.02
 # Below this many frames carrying text the extent is not measured at all and the
 # bar falls back to the full frame width.
 MIN_TEXT_FRAMES = 5
+
+# --- Horizontal extent over time ---------------------------------------------
+# One extent for the whole video has to fit the longest line there is, so every
+# short line gets a bar far wider than its text. Sampling on a fixed grid gives
+# the extent of whatever is on screen at each moment instead. The grid is not
+# the transcript's: those cues are timed from the audio and routinely run tens
+# of seconds, while the burned-in text changes several times inside one of them.
+# Repetition cannot be used to separate text from background at a single moment,
+# so each frame is thresholded against its own background instead.
+SPAN_STEP = 1.0
+# A column must reach this share of the band's rows to carry text. Absolute, so
+# a frame showing no text at all yields no span rather than a background one.
+SPAN_FLOOR = 0.12
+SPAN_BG_MULTIPLIER = 2.5
+# Percentile of the column profile taken as its background level. Low enough
+# that a line covering most of the frame does not raise its own threshold.
+SPAN_BG_PERCENTILE = 25
+# Levels for growing the span outwards from the strongest run, over the fainter
+# ends of the same line, and the gap that growth is allowed to bridge.
+SPAN_WEAK_FLOOR = 0.05
+SPAN_WEAK_MULTIPLIER = 1.5
+SPAN_JOIN_RATIO = 0.06
+# A span narrower than this share of the frame is background speckle rather than
+# a line of subtitles, and putting a bar on it would only add a flicker.
+SPAN_MIN_WIDTH_RATIO = 0.06
+SPAN_CACHE_FILE = "output/log/hardsub_spans.json"
 
 
 def _sample_gray_frames(cap, sample_frames):
@@ -241,6 +268,120 @@ def _text_columns(grays, top, bottom, text_frames):
     return int(left), int(right)
 
 
+def _frame_span(gray, top, bottom):
+    """Left/right columns carrying text in a single frame, or None when it is blank.
+
+    Same profile the video-wide measurement uses, but scored within one frame:
+    the threshold is the frame's own background level inside the band, and the
+    absolute floor is what makes a frame with no subtitle return nothing at all
+    instead of the extent of whatever detail happens to sit in those rows.
+
+    Background is read off a low percentile rather than the median, because a
+    line of subtitles routinely covers more than half the frame -- the median of
+    such a profile is the text itself, and thresholding against it keeps only
+    the few strongest words. What remains of the line is then recovered by
+    growing the strongest run outwards at a much lower level: the ends of a line
+    sitting over a bright background produce far weaker edges than its middle,
+    but they still have to end up under the bar.
+    """
+    work_w = gray.shape[1]
+    cols = _smooth(_col_scores(gray, top, bottom),
+                   window=max(3, int(COL_SMOOTH_RATIO * work_w) | 1))
+    margin = int(work_w * SIDE_MARGIN_RATIO)
+    cols[:margin] = 0.0
+    cols[work_w - margin:] = 0.0
+    if cols.max() < SPAN_FLOOR:
+        return None
+
+    background = float(np.percentile(cols, SPAN_BG_PERCENTILE))
+    thresh = max(SPAN_FLOOR, SPAN_BG_MULTIPLIER * background)
+    groups = _group_bands(cols >= thresh, max(2, int(COL_BRIDGE_RATIO * work_w)))
+    groups = [g for g in groups if (g[1] - g[0] + 1) >= COL_MIN_RUN_RATIO * work_w]
+    if not groups:
+        return None
+
+    left, right = max(groups, key=lambda g: cols[g[0]:g[1] + 1].sum())
+    weak = max(SPAN_WEAK_FLOOR, SPAN_WEAK_MULTIPLIER * background)
+    join = int(SPAN_JOIN_RATIO * work_w)
+    for step in (-1, 1):
+        edge, gap = (left if step < 0 else right), 0
+        i = edge + step
+        while 0 <= i < work_w:
+            if cols[i] >= weak:
+                edge, gap = i, 0
+            else:
+                gap += 1
+                if gap > join:
+                    break
+            i += step
+        if step < 0:
+            left = edge
+        else:
+            right = edge
+    if right - left + 1 < SPAN_MIN_WIDTH_RATIO * work_w:
+        return None
+    return int(left), int(right)
+
+
+def _span_cache_key(video_path, y, band_height, step):
+    st = os.stat(video_path)
+    return (f"{os.path.basename(video_path)}|{st.st_size}|{int(st.st_mtime)}"
+            f"|{y},{band_height},{step}|v{DETECTOR_VERSION}")
+
+
+def measure_span_timeline(video_path, y, band_height, step=SPAN_STEP, use_cache=True):
+    """Horizontal extent of the burned-in text through the video, in full-res px.
+
+    Returns ``[(t, (left, right) or None), ...]`` on a ``step``-second grid: the
+    columns the text occupies at that moment, or None where the band holds no
+    text at all. Seeking costs ~30ms a sample, so a grid this dense is a few
+    seconds of work on a video that then takes minutes to encode, and it is
+    cached against the file and the band it was measured for.
+    """
+    key = _span_cache_key(video_path, y, band_height, step)
+    if use_cache:
+        cached = _read_cache(key, SPAN_CACHE_FILE)
+        if cached is not None:
+            return [(t, tuple(span) if span else None) for t, span in cached]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        rprint("[bold yellow]⚠️ Could not open video to measure the subtitle width.[/bold yellow]")
+        return []
+
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        duration = frames / fps if fps > 0 and frames > 0 else 0
+        if not width or not height or duration <= 0:
+            return []
+
+        work_h = max(1, round(height * WORK_WIDTH / width))
+        top = max(0, int(round(y * work_h / height)))
+        bottom = min(work_h - 1, int(round((y + band_height - 1) * work_h / height)))
+        scale_x = width / WORK_WIDTH
+
+        timeline = []
+        for t in np.arange(step / 2, duration, step):
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(t) * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, (WORK_WIDTH, work_h), interpolation=cv2.INTER_AREA)
+            span = _frame_span(gray, top, bottom)
+            timeline.append((round(float(t), 3), (int(round(span[0] * scale_x)),
+                                                  int(round((span[1] + 1) * scale_x)))
+                             if span else None))
+    finally:
+        cap.release()
+
+    _write_cache(key, timeline, SPAN_CACHE_FILE)
+    return timeline
+
+
 def _analyze(grays, cfg):
     """Score every candidate band; return the best one in work-resolution rows."""
     scores = np.array([_row_scores(g) for g in grays])  # (n_frames, work_h)
@@ -308,21 +449,21 @@ def _cache_key(video_path, cfg):
             f"|{settings}|v{DETECTOR_VERSION}")
 
 
-def _read_cache(key):
+def _read_cache(key, path=CACHE_FILE):
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f).get(key)
     except (OSError, ValueError):
         return None
 
 
-def _write_cache(key, value):
+def _write_cache(key, value, path=CACHE_FILE):
     try:
-        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         data = {}
-        if os.path.exists(CACHE_FILE):
+        if os.path.exists(path):
             try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except ValueError:
                 data = {}
@@ -330,7 +471,7 @@ def _write_cache(key, value):
         suffix = f"|v{DETECTOR_VERSION}"
         data = {k: v for k, v in data.items() if k.endswith(suffix)}
         data[key] = value
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except OSError:
         pass  # caching is an optimisation, never a failure
